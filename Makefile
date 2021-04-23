@@ -146,15 +146,15 @@ $(MODULEDIRS):
 TOOLS_MOD_DIR := ./internal/tools
 .PHONY: install-tools
 install-tools:
-	cd $(TOOLS_MOD_DIR) && go install github.com/client9/misspell/cmd/misspell
-	cd $(TOOLS_MOD_DIR) && go install github.com/golangci/golangci-lint/cmd/golangci-lint
-	cd $(TOOLS_MOD_DIR) && go install github.com/google/addlicense
-	cd $(TOOLS_MOD_DIR) && go install github.com/jstemmer/go-junit-report
-	cd $(TOOLS_MOD_DIR) && go install github.com/pavius/impi/cmd/impi
-	cd $(TOOLS_MOD_DIR) && go install github.com/tcnksm/ghr
-	cd $(TOOLS_MOD_DIR) && go install go.opentelemetry.io/collector/cmd/checkdoc
-	cd $(TOOLS_MOD_DIR) && go install go.opentelemetry.io/collector/cmd/issuegenerator
-	cd $(TOOLS_MOD_DIR) && go install go.opentelemetry.io/collector/cmd/mdatagen
+	go install github.com/client9/misspell/cmd/misspell@v0.3.4
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.39.0
+	go install github.com/google/addlicense@v0.0.0-20200906110928-a0294312aa76
+	go install github.com/jstemmer/go-junit-report@v0.9.1
+	go install github.com/pavius/impi/cmd/impi@v0.0.3
+	go install github.com/tcnksm/ghr@v0.13.0
+	go install go.opentelemetry.io/collector/cmd/checkdoc@v0.25.1-0.20210421230708-d10b842f49eb
+	go install go.opentelemetry.io/collector/cmd/issuegenerator@v0.25.1-0.20210421230708-d10b842f49eb
+	go install go.opentelemetry.io/collector/cmd/mdatagen@v0.25.1-0.20210421230708-d10b842f49eb
 
 .PHONY: run
 run:

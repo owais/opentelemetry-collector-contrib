@@ -1,6 +1,6 @@
 module github.com/open-telemetry/opentelemetry-collector-contrib/internal/stanza
 
-go 1.15
+go 1.16
 
 require (
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/storage v0.0.0-20210403015025-665fae9cf30e
