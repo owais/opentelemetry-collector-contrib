@@ -12,7 +12,7 @@ require (
 	github.com/pelletier/go-toml v1.8.0 // indirect
 	github.com/shirou/gopsutil v3.21.3+incompatible
 	github.com/stretchr/testify v1.7.0
-	github.com/testcontainers/testcontainers-go v0.10.0
+	github.com/testcontainers/testcontainers-go v0.11.1
 	go.opentelemetry.io/collector v0.25.1-0.20210421230708-d10b842f49eb
 	go.uber.org/atomic v1.7.0
 	go.uber.org/zap v1.16.0
