@@ -19,12 +19,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strings"
-	"sync"
 	"time"
 
-	agentmetricspb "github.com/census-instrumentation/opencensus-proto/gen-go/agent/metrics/v1"
 	dtypes "github.com/docker/docker/api/types"
+	dEvents "github.com/docker/docker/api/types/events"
 	dfilters "github.com/docker/docker/api/types/filters"
 	docker "github.com/docker/docker/client"
 	"go.uber.org/zap"
@@ -35,22 +33,14 @@ const (
 	userAgent        = "OpenTelemetry-Collector Docker Stats Receiver/v0.0.1"
 )
 
-// dockerClient provides the core metric gathering functionality from the Docker Daemon.
-// It retrieves container information in two forms to produce metric data: dtypes.ContainerJSON
-// from client.ContainerInspect() for container information (id, name, hostname, labels, and env)
-// and dtypes.StatsJSON from client.ContainerStats() for metric values.
-type dockerClient struct {
-	client               *docker.Client
-	config               *Config
-	containers           map[string]DockerContainer
-	containersLock       sync.Mutex
-	excludedImageMatcher *StringMatcher
-	logger               *zap.Logger
+type dockerBackend struct {
+	client *docker.Client
+	logger *zap.Logger
 }
 
-func newDockerClient(config *Config, logger *zap.Logger) (*dockerClient, error) {
+func newDockerBackend(endpoint string, logger *zap.Logger) (*dockerBackend, error) {
 	client, err := docker.NewClientWithOpts(
-		docker.WithHost(config.Endpoint),
+		docker.WithHost(endpoint),
 		docker.WithVersion(dockerAPIVersion),
 		docker.WithHTTPHeaders(map[string]string{"User-Agent": userAgent}),
 	)
@@ -58,122 +48,131 @@ func newDockerClient(config *Config, logger *zap.Logger) (*dockerClient, error) 
 		return nil, fmt.Errorf("could not create docker client: %w", err)
 	}
 
-	excludedImageMatcher, err := NewStringMatcher(config.ExcludedImages)
-	if err != nil {
-		return nil, fmt.Errorf("could not determine docker client excluded images: %w", err)
-	}
+	return &dockerBackend{client, logger}, nil
 
-	dc := &dockerClient{
-		client:               client,
-		config:               config,
-		logger:               logger,
-		containers:           make(map[string]DockerContainer),
-		containersLock:       sync.Mutex{},
-		excludedImageMatcher: excludedImageMatcher,
-	}
-
-	return dc, nil
 }
 
-// Provides a slice of DockerContainers to use for individual FetchContainerStats calls.
-func (dc *dockerClient) Containers() []DockerContainer {
-	dc.containersLock.Lock()
-	defer dc.containersLock.Unlock()
-	containers := make([]DockerContainer, 0, len(dc.containers))
-	for _, container := range dc.containers {
-		containers = append(containers, container)
+func (d *dockerBackend) Events(ctx context.Context, since time.Time, fops []eventFilterOption) (<-chan dEvents.Event, <-chan error) {
+	filters := []dfilters.KeyValuePair{}
+	for _, f := range fops {
+		filters = append(filters, dfilters.KeyValuePair{
+			Key:   f.Key,
+			Value: f.Value,
+		})
 	}
-	return containers
+
+	options := dtypes.EventsOptions{
+		Filters: dfilters.NewArgs(filters...),
+		Since:   since.Format(time.RFC3339Nano),
+	}
+	return d.client.Events(ctx, options)
 }
 
-// LoadContainerList will load the initial running container maps for
-// inspection and establishing which containers warrant stat gathering calls
-// by the receiver.
-func (dc *dockerClient) LoadContainerList(ctx context.Context) error {
-	// Build initial container maps before starting loop
+func (d *dockerBackend) List(ctx context.Context, fops filterOptions) ([]containerBase, error) {
 	filters := dfilters.NewArgs()
-	filters.Add("status", "running")
+	filters.Add("status", fops.status)
 	options := dtypes.ContainerListOptions{
 		Filters: filters,
 	}
 
-	listCtx, cancel := context.WithTimeout(ctx, dc.config.Timeout)
-	containerList, err := dc.client.ContainerList(listCtx, options)
-	defer cancel()
+	dockerContainers, err := d.client.ContainerList(ctx, options)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	wg := sync.WaitGroup{}
-	for _, c := range containerList {
-		wg.Add(1)
-		go func(container dtypes.Container) {
-			if !dc.shouldBeExcluded(container.Image) {
-				if cnt, ok := dc.inspectedContainerIsOfInterest(ctx, container.ID); ok {
-					dc.persistContainer(cnt)
-				}
-			} else {
-				dc.logger.Debug(
-					"Not monitoring container per ExcludedImages",
-					zap.String("image", container.Image),
-					zap.String("id", container.ID),
-				)
-			}
-			wg.Done()
-		}(c)
+	containers := make([]containerBase, len(dockerContainers))
+	for _, dc := range dockerContainers {
+		containers = append(containers, containerBase{
+			ID: dc.ID,
+		})
 	}
-	wg.Wait()
-	return nil
+
+	return containers, nil
 }
 
-// FetchContainerStatsAndConvertToMetrics will query the desired container stats and send
-// converted metrics to the results channel, since this is intended to be run in a goroutine.
-func (dc *dockerClient) FetchContainerStatsAndConvertToMetrics(
-	ctx context.Context,
-	container DockerContainer,
-) (*agentmetricspb.ExportMetricsServiceRequest, error) {
-	dc.logger.Debug("Fetching container stats.", zap.String("id", container.ID))
-	statsCtx, cancel := context.WithTimeout(ctx, dc.config.Timeout)
-	containerStats, err := dc.client.ContainerStats(statsCtx, container.ID, false)
-	defer cancel()
+func (d *dockerBackend) Inspect(ctx context.Context, id string) (*container, error) {
+	c, err := d.client.ContainerInspect(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &container{
+		ID:           c.ID,
+		Image:        c.Image,
+		Name:         c.Name,
+		Hostname:     c.Config.Hostname,
+		Labels:       c.Config.Labels,
+		StateRunning: c.State.Running,
+		StatePaused:  c.State.Paused,
+		EnvMap:       containerEnvToMap(c.Config.Env),
+	}, nil
+}
+
+func (d *dockerBackend) translateStats(s *dtypes.StatsJSON) *stats {
+	networks := make(map[string]networkStats, len(s.Networks))
+	for k, v := range s.Networks {
+		networks[k] = networkStats(v)
+	}
+
+	return &stats{
+		ID:      s.ID,
+		Name:    s.Name,
+		Read:    s.Read,
+		PreRead: s.PreRead,
+		BlkioStats: blkioStats{
+			IoServiceBytesRecursive: []blkioStatEntry(s.BlkioStats.IoServiceBytesRecursive),
+			/*
+				IoServicedRecursive:
+				IoQueuedRecursive:
+				IoServiceTimeRecursive:
+				IoWaitTimeRecursive     []blkioStatEntry
+				IoMergedRecursive       []blkioStatEntry
+				IoTimeRecursive         []blkioStatEntry
+				SectorsRecursive        []blkioStatEntry
+			*/
+		},
+		CPUStats: cpuStats{
+			OnlineCPUs:     s.CPUStats.OnlineCPUs,
+			SystemUsage:    s.CPUStats.SystemUsage,
+			CPUUsage:       cpuUsage(s.CPUStats.CPUUsage),
+			ThrottlingData: throttlingData(s.CPUStats.ThrottlingData),
+		},
+		PreCPUStats: cpuStats{
+			OnlineCPUs:     s.PreCPUStats.OnlineCPUs,
+			SystemUsage:    s.PreCPUStats.SystemUsage,
+			CPUUsage:       cpuUsage(s.PreCPUStats.CPUUsage),
+			ThrottlingData: throttlingData(s.PreCPUStats.ThrottlingData),
+		},
+		MemoryStats: memoryStats{
+			Usage:    s.MemoryStats.Usage,
+			MaxUsage: s.MemoryStats.MaxUsage,
+			Stats:    s.MemoryStats.Stats,
+			Limit:    s.MemoryStats.Limit,
+		},
+		Networks: networks,
+	}
+}
+
+func (d *dockerBackend) Stats(ctx context.Context, id string) (*stats, error) {
+	containerStats, err := d.client.ContainerStats(ctx, id, false)
 	if err != nil {
 		if docker.IsErrNotFound(err) {
-			dc.logger.Debug(
-				"Daemon reported container doesn't exist. Will no longer monitor.",
-				zap.String("id", container.ID),
-			)
-			dc.removeContainer(container.ID)
-		} else {
-			dc.logger.Warn(
-				"Could not fetch docker containerStats for container",
-				zap.String("id", container.ID),
-				zap.Error(err),
-			)
+			err = errDoesNotExist{err}
 		}
-
 		return nil, err
 	}
 
-	statsJSON, err := dc.toStatsJSON(containerStats, &container)
+	statsJSON, err := d.toStatsJSON(containerStats, id)
 	if err != nil {
 		return nil, err
 	}
-
-	md, err := ContainerStatsToMetrics(statsJSON, &container, dc.config)
-	if err != nil {
-		dc.logger.Error(
-			"Could not convert docker containerStats for container id",
-			zap.String("id", container.ID),
-			zap.Error(err),
-		)
-		return nil, err
-	}
-	return md, nil
+	_ = statsJSON
+	// TODO: convert statsJSON to stats
+	return d.translateStats(statsJSON), nil
 }
 
-func (dc *dockerClient) toStatsJSON(
+func (d *dockerBackend) toStatsJSON(
 	containerStats dtypes.ContainerStats,
-	container *DockerContainer,
+	id string,
 ) (*dtypes.StatsJSON, error) {
 	var statsJSON dtypes.StatsJSON
 	err := json.NewDecoder(containerStats.Body).Decode(&statsJSON)
@@ -184,140 +183,12 @@ func (dc *dockerClient) toStatsJSON(
 			// It isn't indicative of actual error.
 			return nil, err
 		}
-		dc.logger.Error(
+		d.logger.Error(
 			"Could not parse docker containerStats for container id",
-			zap.String("id", container.ID),
+			zap.String("id", id),
 			zap.Error(err),
 		)
 		return nil, err
 	}
 	return &statsJSON, nil
-}
-
-func (dc *dockerClient) ContainerEventLoop(ctx context.Context) {
-	filters := dfilters.NewArgs([]dfilters.KeyValuePair{
-		{Key: "type", Value: "container"},
-		{Key: "event", Value: "destroy"},
-		{Key: "event", Value: "die"},
-		{Key: "event", Value: "pause"},
-		{Key: "event", Value: "stop"},
-		{Key: "event", Value: "start"},
-		{Key: "event", Value: "unpause"},
-		{Key: "event", Value: "update"},
-	}...)
-	lastTime := time.Now()
-
-EVENT_LOOP:
-	for {
-		options := dtypes.EventsOptions{
-			Filters: filters,
-			Since:   lastTime.Format(time.RFC3339Nano),
-		}
-		eventCh, errCh := dc.client.Events(ctx, options)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case event := <-eventCh:
-				switch event.Action {
-				case "destroy":
-					dc.logger.Debug("Docker container was destroyed:", zap.String("id", event.ID))
-					dc.removeContainer(event.ID)
-				default:
-					dc.logger.Debug(
-						"Docker container update:",
-						zap.String("id", event.ID),
-						zap.String("action", event.Action),
-					)
-
-					if container, ok := dc.inspectedContainerIsOfInterest(ctx, event.ID); ok {
-						dc.persistContainer(container)
-					}
-				}
-
-				if event.TimeNano > lastTime.UnixNano() {
-					lastTime = time.Unix(0, event.TimeNano)
-				}
-
-			case err := <-errCh:
-				// We are only interested when the context hasn't been canceled since requests made
-				// with a closed context are guaranteed to fail.
-				if ctx.Err() == nil {
-					dc.logger.Error("Error watching docker container events", zap.Error(err))
-					// Either decoding or connection error has occurred, so we should resume the event loop after
-					// waiting a moment.  In cases of extended daemon unavailability this will retry until
-					// collector teardown or background context is closed.
-					select {
-					case <-time.After(3 * time.Second):
-						continue EVENT_LOOP
-					case <-ctx.Done():
-						return
-					}
-				}
-			}
-		}
-	}
-}
-
-// Queries inspect api and returns *ContainerJSON and true when container should be queried for stats,
-// nil and false otherwise.
-func (dc *dockerClient) inspectedContainerIsOfInterest(ctx context.Context, cid string) (*dtypes.ContainerJSON, bool) {
-	inspectCtx, cancel := context.WithTimeout(ctx, dc.config.Timeout)
-	container, err := dc.client.ContainerInspect(inspectCtx, cid)
-	defer cancel()
-	if err != nil {
-		dc.logger.Error(
-			"Could not inspect updated container",
-			zap.String("id", cid),
-			zap.Error(err),
-		)
-	} else if !dc.shouldBeExcluded(container.Config.Image) {
-		return &container, true
-	}
-	return nil, false
-}
-
-func (dc *dockerClient) persistContainer(containerJSON *dtypes.ContainerJSON) {
-	if containerJSON == nil {
-		return
-	}
-
-	cid := containerJSON.ID
-	if !containerJSON.State.Running || containerJSON.State.Paused {
-		dc.logger.Debug("Docker container not running.  Will not persist.", zap.String("id", cid))
-		dc.removeContainer(cid)
-		return
-	}
-
-	dc.logger.Debug("Monitoring Docker container", zap.String("id", cid))
-	dc.containersLock.Lock()
-	defer dc.containersLock.Unlock()
-	dc.containers[cid] = DockerContainer{
-		ContainerJSON: containerJSON,
-		EnvMap:        containerEnvToMap(containerJSON.Config.Env),
-	}
-}
-
-func (dc *dockerClient) removeContainer(cid string) {
-	dc.containersLock.Lock()
-	defer dc.containersLock.Unlock()
-	delete(dc.containers, cid)
-	dc.logger.Debug("Removed container from stores.", zap.String("id", cid))
-}
-
-func (dc *dockerClient) shouldBeExcluded(image string) bool {
-	return dc.excludedImageMatcher != nil && dc.excludedImageMatcher.Matches(image)
-}
-
-func containerEnvToMap(env []string) map[string]string {
-	out := make(map[string]string, len(env))
-	for _, v := range env {
-		parts := strings.Split(v, "=")
-		if len(parts) < 2 || strings.TrimSpace(parts[1]) == "" {
-			continue
-		}
-		out[parts[0]] = parts[1]
-	}
-	return out
 }

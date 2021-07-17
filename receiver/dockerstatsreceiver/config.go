@@ -25,6 +25,8 @@ var _ config.Receiver = (*Config)(nil)
 
 type Config struct {
 	config.ReceiverSettings `mapstructure:",squash"`
+	// The container backend/API to use. Default is "docker"
+	Backend string `mapstructure:"backend"`
 	// The URL of the docker server.  Default is "unix:///var/run/docker.sock"
 	Endpoint string `mapstructure:"endpoint"`
 	// The time between each collection event.  Default is 10s.

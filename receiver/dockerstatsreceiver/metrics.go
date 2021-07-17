@@ -42,17 +42,19 @@ type DockerContainer struct {
 }
 
 func ContainerStatsToMetrics(
-	containerStats *dtypes.StatsJSON,
-	container *DockerContainer,
+	// containerStats *dtypes.StatsJSON,
+
+	stats *stats,
+	container *container,
 	config *Config,
 ) (*agentmetricspb.ExportMetricsServiceRequest, error) {
 	now := timestamppb.New(time.Now())
 
 	var metrics []*metricspb.Metric
-	metrics = append(metrics, blockioMetrics(&containerStats.BlkioStats, now)...)
-	metrics = append(metrics, cpuMetrics(&containerStats.CPUStats, &containerStats.PreCPUStats, now, config.ProvidePerCoreCPUMetrics)...)
-	metrics = append(metrics, memoryMetrics(&containerStats.MemoryStats, now)...)
-	metrics = append(metrics, networkMetrics(&containerStats.Networks, now)...)
+	metrics = append(metrics, blockioMetrics(&stats.BlkioStats, now)...)
+	metrics = append(metrics, cpuMetrics(&stats.CPUStats, &stats.PreCPUStats, now, config.ProvidePerCoreCPUMetrics)...)
+	metrics = append(metrics, memoryMetrics(&stats.MemoryStats, now)...)
+	metrics = append(metrics, networkMetrics(&stats.Networks, now)...)
 
 	if len(metrics) == 0 {
 		return nil, nil
@@ -63,9 +65,9 @@ func ContainerStatsToMetrics(
 		Resource: &resourcepb.Resource{
 			Type: "container",
 			Labels: map[string]string{
-				"container.hostname":                container.Config.Hostname,
+				"container.hostname":                container.Hostname,
 				conventions.AttributeContainerID:    container.ID,
-				conventions.AttributeContainerImage: container.Config.Image,
+				conventions.AttributeContainerImage: container.Image,
 				conventions.AttributeContainerName:  strings.TrimPrefix(container.Name, "/"),
 			},
 		},
@@ -76,7 +78,7 @@ func ContainerStatsToMetrics(
 	return md, nil
 }
 
-func updateConfiguredResourceLabels(md *agentmetricspb.ExportMetricsServiceRequest, container *DockerContainer, config *Config) {
+func updateConfiguredResourceLabels(md *agentmetricspb.ExportMetricsServiceRequest, container *container, config *Config) {
 	for k, label := range config.EnvVarsToMetricLabels {
 		if v := container.EnvMap[k]; v != "" {
 			md.Resource.Labels[label] = v
@@ -84,7 +86,7 @@ func updateConfiguredResourceLabels(md *agentmetricspb.ExportMetricsServiceReque
 	}
 
 	for k, label := range config.ContainerLabelsToMetricLabels {
-		if v := container.Config.Labels[k]; v != "" {
+		if v := container.Labels[k]; v != "" {
 			md.Resource.Labels[label] = v
 		}
 	}
@@ -93,12 +95,12 @@ func updateConfiguredResourceLabels(md *agentmetricspb.ExportMetricsServiceReque
 type blkioStat struct {
 	name    string
 	unit    string
-	entries []dtypes.BlkioStatEntry
+	entries []blkioStatEntry
 }
 
 // metrics for https://www.kernel.org/doc/Documentation/cgroup-v1/blkio-controller.txt
 func blockioMetrics(
-	blkioStats *dtypes.BlkioStats,
+	blkioStats *blkioStats,
 	ts *timestamp.Timestamp,
 ) []*metricspb.Metric {
 	var metrics []*metricspb.Metric
@@ -130,8 +132,8 @@ func blockioMetrics(
 }
 
 func cpuMetrics(
-	cpuStats *dtypes.CPUStats,
-	previousCPUStats *dtypes.CPUStats,
+	cpuStats *cpuStats,
+	previousCPUStats *cpuStats,
 	ts *timestamp.Timestamp,
 	providePerCoreMetrics bool,
 ) []*metricspb.Metric {
@@ -181,7 +183,7 @@ func cpuMetrics(
 // violate applicable laws.
 // For more information, please see https://www.bis.doc.gov
 // See also https://www.apache.org/dev/crypto.html and/or seek legal counsel.
-func calculateCPUPercent(previous *dtypes.CPUStats, v *dtypes.CPUStats) float64 {
+func calculateCPUPercent(previous *cpuStats, v *cpuStats) float64 {
 	var (
 		cpuPercent = 0.0
 		// calculate the change for the cpu usage of the container in between readings
@@ -212,7 +214,7 @@ var memoryStatsThatAreCumulative = map[string]bool{
 }
 
 func memoryMetrics(
-	memoryStats *dtypes.MemoryStats,
+	memoryStats *memoryStats,
 	ts *timestamp.Timestamp,
 ) []*metricspb.Metric {
 	var metrics []*metricspb.Metric
@@ -256,7 +258,7 @@ func memoryMetrics(
 }
 
 func networkMetrics(
-	networks *map[string]dtypes.NetworkStats,
+	networks *map[string]networkStats,
 	ts *timestamp.Timestamp,
 ) []*metricspb.Metric {
 	if networks == nil || *networks == nil {
